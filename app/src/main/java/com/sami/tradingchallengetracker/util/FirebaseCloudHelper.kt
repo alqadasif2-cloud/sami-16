@@ -48,6 +48,9 @@ object FirebaseCloudHelper {
     private const val SHARED_FIREBASE_APP_ID = "1:462035009117:web:ef127abfd25d8ff2ec17b4"
     private const val SHARED_FIREBASE_SENDER_ID = "462035009117"
 
+    private const val SHARED_FIRESTORE_APP_NAME = "sami_shared_firestore"
+    const val DEFAULT_REMOTE_SERVER_URL = "https://ais-pre-v2pd4io33vpee4p7cqhqoz-27831794049.europe-west2.run.app"
+
     // Shared Firestore collections
     const val COLLECTION_NOTIFICATIONS = "community_notifications"
     const val COLLECTION_CHANNELS = "community_channels"
@@ -60,6 +63,16 @@ object FirebaseCloudHelper {
     @Volatile
     private var listeningForUserId: Int = 0
 
+    private fun buildSharedFirestoreOptions(): FirebaseOptions {
+        return FirebaseOptions.Builder()
+            .setProjectId(SHARED_FIREBASE_PROJECT_ID)
+            .setApplicationId(SHARED_FIREBASE_APP_ID)
+            .setApiKey(SHARED_FIREBASE_API_KEY)
+            .setGcmSenderId(SHARED_FIREBASE_SENDER_ID)
+            .setStorageBucket(SHARED_FIREBASE_STORAGE_BUCKET)
+            .build()
+    }
+
     @Synchronized
     fun ensureInitialized(context: Context): Boolean {
         return try {
@@ -71,14 +84,7 @@ object FirebaseCloudHelper {
             if (defaultApp != null) {
                 return true
             }
-            val options = FirebaseOptions.Builder()
-                .setProjectId(SHARED_FIREBASE_PROJECT_ID)
-                .setApplicationId(SHARED_FIREBASE_APP_ID)
-                .setApiKey(SHARED_FIREBASE_API_KEY)
-                .setGcmSenderId(SHARED_FIREBASE_SENDER_ID)
-                .setStorageBucket(SHARED_FIREBASE_STORAGE_BUCKET)
-                .build()
-            FirebaseApp.initializeApp(appCtx, options)
+            FirebaseApp.initializeApp(appCtx, buildSharedFirestoreOptions())
             Log.d(TAG, "Initialized FirebaseApp explicitly with shared Sami configuration.")
             true
         } catch (e: Exception) {
@@ -87,15 +93,29 @@ object FirebaseCloudHelper {
         }
     }
 
+    @Synchronized
+    private fun getSharedFirestoreApp(context: Context): FirebaseApp {
+        ensureInitialized(context)
+        val appCtx = context.applicationContext
+        val defaultApp = FirebaseApp.getInstance()
+        if (defaultApp.options.projectId == SHARED_FIREBASE_PROJECT_ID) {
+            return defaultApp
+        }
+        val existingNamed = FirebaseApp.getApps(appCtx).firstOrNull { it.name == SHARED_FIRESTORE_APP_NAME }
+        if (existingNamed != null) {
+            return existingNamed
+        }
+        return FirebaseApp.initializeApp(appCtx, buildSharedFirestoreOptions(), SHARED_FIRESTORE_APP_NAME)
+    }
+
     fun isFirebaseConfigured(context: Context): Boolean {
         return ensureInitialized(context)
     }
 
     fun getFirestore(context: Context): FirebaseFirestore {
-        ensureInitialized(context)
         return try {
-            val app = FirebaseApp.getInstance()
-            FirebaseFirestore.getInstance(app, SHARED_FIRESTORE_DB_ID)
+            val sharedApp = getSharedFirestoreApp(context)
+            FirebaseFirestore.getInstance(sharedApp, SHARED_FIRESTORE_DB_ID)
         } catch (e: Exception) {
             Log.w(TAG, "Named Firestore fallback to default: ${e.message}")
             FirebaseFirestore.getInstance()
@@ -103,9 +123,9 @@ object FirebaseCloudHelper {
     }
 
     fun getStorage(context: Context): FirebaseStorage {
-        ensureInitialized(context)
         return try {
-            FirebaseStorage.getInstance("gs://$SHARED_FIREBASE_STORAGE_BUCKET")
+            val sharedApp = getSharedFirestoreApp(context)
+            FirebaseStorage.getInstance(sharedApp, "gs://$SHARED_FIREBASE_STORAGE_BUCKET")
         } catch (e: Exception) {
             FirebaseStorage.getInstance()
         }
@@ -155,6 +175,39 @@ object FirebaseCloudHelper {
         return "fcm_tok_${userId}_$safeDev"
     }
 
+    private fun postFcmApiSync(
+        endpointPath: String,
+        userId: Int,
+        username: String,
+        bodyJson: String
+    ) {
+        if (userId <= 0 || username.isBlank()) return
+        try {
+            val sessionJson = org.json.JSONObject()
+                .put("id", userId)
+                .put("username", username)
+                .put("displayName", username)
+                .toString()
+            val encodedSession = java.net.URLEncoder.encode(sessionJson, "UTF-8")
+            val conn = (URL("$DEFAULT_REMOTE_SERVER_URL$endpointPath").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 8_000
+                readTimeout = 8_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                setRequestProperty("X-Sami-Session", encodedSession)
+            }
+            try {
+                conn.outputStream.use { it.write(bodyJson.toByteArray(Charsets.UTF_8)) }
+                conn.responseCode
+            } finally {
+                conn.disconnect()
+            }
+        } catch (_: Exception) {
+            // Firestore registration remains primary shared source of truth
+        }
+    }
+
     /**
      * Registers or refreshes the device's FCM token in the authorized shared Firestore
      * collection (`community_notifications/fcm_tok_{userId}_{deviceId}`), unbinding any
@@ -165,16 +218,16 @@ object FirebaseCloudHelper {
         token: String,
         userId: Int,
         username: String
-    ): Boolean {
+    ): Boolean = withContext(Dispatchers.IO) {
         val cleanToken = token.trim()
-        if (cleanToken.isEmpty() || userId <= 0) return false
-        val db = runCatching { getFirestore(context) }.getOrNull() ?: return false
+        if (cleanToken.isEmpty() || userId <= 0) return@withContext false
+        val db = runCatching { getFirestore(context) }.getOrNull() ?: return@withContext false
         val deviceId = getStableDeviceId(context)
         val docId = buildTokenDocId(userId, deviceId)
         val now = System.currentTimeMillis()
         val model = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
 
-        return try {
+        val firestoreOk = try {
             try {
                 val sameDeviceDocs = db.collection(COLLECTION_NOTIFICATIONS)
                     .whereEqualTo("type", "fcm_device_token")
@@ -231,18 +284,40 @@ object FirebaseCloudHelper {
             Log.w(TAG, "Failed to sync FCM token to Firestore: ${e.message}")
             false
         }
+
+        val reqBody = org.json.JSONObject()
+            .put("token", cleanToken)
+            .put("deviceId", deviceId)
+            .put("platform", "android")
+            .put("deviceModel", model)
+            .toString()
+        postFcmApiSync("/api/fcm/register", userId, username, reqBody)
+
+        firestoreOk
     }
 
     /**
      * Removes this device's FCM token binding on logout or account switch so private notifications
      * are never delivered after sign-out.
      */
-    suspend fun removeDeviceFcmToken(context: Context, userId: Int): Boolean {
-        if (userId <= 0) return false
-        val db = runCatching { getFirestore(context) }.getOrNull() ?: return false
+    suspend fun removeDeviceFcmToken(context: Context, userId: Int): Boolean = withContext(Dispatchers.IO) {
+        if (userId <= 0) return@withContext false
         val deviceId = getStableDeviceId(context)
+        val prefs = context.getSharedPreferences(SamiFirebaseMessagingService.PREFS_NAME, Context.MODE_PRIVATE)
+        val savedTok = prefs.getString(SamiFirebaseMessagingService.KEY_FCM_TOKEN, "") ?: ""
+        val savedUser = prefs.getString(SamiFirebaseMessagingService.KEY_CURRENT_USERNAME, "") ?: ""
+
+        if (savedUser.isNotBlank()) {
+            val reqBody = org.json.JSONObject()
+                .put("deviceId", deviceId)
+                .apply { if (savedTok.isNotBlank()) put("token", savedTok) }
+                .toString()
+            postFcmApiSync("/api/fcm/unregister", userId, savedUser, reqBody)
+        }
+
+        val db = runCatching { getFirestore(context) }.getOrNull() ?: return@withContext false
         val docId = buildTokenDocId(userId, deviceId)
-        return try {
+        try {
             db.collection(COLLECTION_NOTIFICATIONS)
                 .document(docId)
                 .delete()

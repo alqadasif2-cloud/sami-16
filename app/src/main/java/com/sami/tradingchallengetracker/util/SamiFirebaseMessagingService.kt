@@ -148,11 +148,21 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
                 return true
             }
             list.add(dedupKey)
-            while (list.size > 80) {
+            while (list.size > 100) {
                 list.removeAt(0)
             }
             prefs.edit().putString(KEY_RECENT_MSG_IDS, list.joinToString("|")).apply()
             return false
+        }
+
+        private fun isAlreadyActiveInSystemTray(context: Context, tag: String): Boolean {
+            if (tag.isBlank()) return false
+            return try {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                nm?.activeNotifications?.any { it.tag == tag } == true
+            } catch (_: Exception) {
+                false
+            }
         }
 
         fun postAuthorizedSystemNotification(
@@ -186,13 +196,18 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
                 return
             }
 
-            // Deduplicate across FCM + background Firestore listener
-            val dedupKey = if (messageId.isNotBlank()) {
-                "u${currentUserId}_$messageId"
+            val normTag = messageId.trim().take(64)
+
+            // Deduplicate across FCM system tray + onMessageReceived + background Firestore listener
+            val dedupKey = if (normTag.isNotBlank()) {
+                "u${currentUserId}_$normTag"
             } else {
                 "u${currentUserId}_${chatType}_${channelId}_${partnerId ?: 0}_${title.hashCode()}_${body.hashCode()}"
             }
             if (isDuplicateAndRecord(appCtx, dedupKey)) {
+                return
+            }
+            if (normTag.isNotBlank() && isAlreadyActiveInSystemTray(appCtx, normTag)) {
                 return
             }
 
@@ -209,17 +224,20 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
             }
 
             val channelIdNotification = if (chatType == "private") CHANNEL_ID_PRIVATE else CHANNEL_ID_PUBLIC
-            val notificationId = if (messageId.isNotEmpty()) {
-                messageId.hashCode()
+            // Match FCM system-tray (tag, 0) slot when messageId is present so OS coalesces instead of duplicating
+            val notificationId = if (normTag.isNotEmpty()) {
+                0
             } else {
                 (System.currentTimeMillis() % 100000).toInt()
             }
+            val requestCode = if (normTag.isNotEmpty()) normTag.hashCode() else notificationId
 
             val intent = Intent(appCtx, MainActivity::class.java).apply {
-                action = "OPEN_SAMI_CHAT_${notificationId}"
+                action = "OPEN_SAMI_CHAT"
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra("fromNotification", true)
                 putExtra("chatType", chatType)
+                putExtra("recipientUserId", currentUserId.toString())
                 if (channelId.isNotEmpty()) putExtra("channelId", channelId)
                 if (partnerId != null && partnerId > 0) {
                     putExtra("partnerId", partnerId)
@@ -231,7 +249,7 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
 
             val pendingIntent = PendingIntent.getActivity(
                 appCtx,
-                notificationId,
+                requestCode,
                 intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
@@ -271,7 +289,7 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
                 val notificationManager = NotificationManagerCompat.from(appCtx)
                 if (notificationManager.areNotificationsEnabled()) {
                     notificationManager.notify(
-                        messageId.ifEmpty { "sami_notif_$notificationId" },
+                        normTag.ifEmpty { "sami_notif_$notificationId" },
                         notificationId,
                         builder.build()
                     )
@@ -309,18 +327,33 @@ class SamiFirebaseMessagingService : FirebaseMessagingService() {
     override fun onMessageReceived(remoteMessage: RemoteMessage) {
         super.onMessageReceived(remoteMessage)
 
+        // Ensure Firebase & channels work independently even when MainActivity/WebView is completely closed
+        FirebaseCloudHelper.ensureInitialized(applicationContext)
+
         val data = remoteMessage.data
         val notification = remoteMessage.notification
 
-        val title = data["title"] ?: notification?.title ?: "رسالة جديدة - Sami"
-        val body = data["body"] ?: notification?.body ?: "لديك إشعار جديد في تطبيق Sami"
-        val chatType = data["chatType"] ?: if (!data["partnerId"].isNullOrBlank()) "private" else "channel"
+        val title = data["title"]?.takeIf { it.isNotBlank() }
+            ?: notification?.title?.takeIf { it.isNotBlank() }
+            ?: "رسالة جديدة - Sami"
+        val body = data["body"]?.takeIf { it.isNotBlank() }
+            ?: notification?.body?.takeIf { it.isNotBlank() }
+            ?: "لديك إشعار جديد في تطبيق Sami"
+        val chatType = data["chatType"]?.takeIf { it.isNotBlank() }
+            ?: if (!data["partnerId"].isNullOrBlank() || data["type"] == "private_message") "private" else "channel"
         val channelId = data["channelId"] ?: ""
         val senderId = data["senderId"]?.toIntOrNull()
-        val partnerId = data["partnerId"]?.toIntOrNull() ?: if (chatType == "private") senderId else null
-        val messageId = data["messageId"] ?: remoteMessage.messageId ?: ""
+        val partnerId = data["partnerId"]?.toIntOrNull()
+            ?: data["partnerIdStr"]?.toIntOrNull()
+            ?: data["privateChatWithUserId"]?.toIntOrNull()
+            ?: if (chatType == "private") senderId else null
+        val messageId = data["messageId"]?.takeIf { it.isNotBlank() }
+            ?: notification?.tag?.takeIf { it.isNotBlank() }
+            ?: remoteMessage.messageId
+            ?: ""
         val senderName = data["senderName"] ?: ""
-        val targetRecipientId = data["recipientUserId"]?.toIntOrNull() ?: data["recipientId"]?.toIntOrNull()
+        val targetRecipientId = data["recipientUserId"]?.toIntOrNull()
+            ?: data["recipientId"]?.toIntOrNull()
 
         postAuthorizedSystemNotification(
             context = applicationContext,

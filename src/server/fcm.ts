@@ -12,8 +12,11 @@ import {
 
 /**
  * Firebase Cloud Messaging (FCM) Push Notification Service for Sami
- * Uses shared Firestore collection `community_notifications` (type = 'fcm_device_token' for tokens
- * and fcmStatus = 'pending' for push jobs) which is authorized across Web, Android, and Server.
+ * - Stores device tokens & outbox state in shared Firestore `community_notifications`
+ *   (preserving existing projectId + databaseId and all user/chat data).
+ * - Dispatches OS-level Android notifications (notification + data with HIGH priority and
+ *   OPEN_SAMI_CHAT click_action) so notifications arrive even when the Sami UI is closed
+ *   or swiped away from Android Recents, without requiring background keep-alive services.
  */
 
 export interface DeviceTokenRecord {
@@ -116,43 +119,48 @@ export async function registerDeviceToken(params: {
 
   // Clean stale bindings in shared Firestore community_notifications (type == 'fcm_device_token')
   try {
-    const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        structuredQuery: {
-          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
-          where: {
-            compositeFilter: {
-              op: 'AND',
-              filters: [
-                {
-                  fieldFilter: {
-                    field: { fieldPath: 'type' },
-                    op: 'EQUAL',
-                    value: { stringValue: 'fcm_device_token' },
+    for (const filterField of [
+      { field: 'deviceId', value: deviceId },
+      { field: 'token', value: cleanToken },
+    ]) {
+      const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          structuredQuery: {
+            from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
+            where: {
+              compositeFilter: {
+                op: 'AND',
+                filters: [
+                  {
+                    fieldFilter: {
+                      field: { fieldPath: 'type' },
+                      op: 'EQUAL',
+                      value: { stringValue: 'fcm_device_token' },
+                    },
                   },
-                },
-                {
-                  fieldFilter: {
-                    field: { fieldPath: 'deviceId' },
-                    op: 'EQUAL',
-                    value: { stringValue: deviceId },
+                  {
+                    fieldFilter: {
+                      field: { fieldPath: filterField.field },
+                      op: 'EQUAL',
+                      value: { stringValue: filterField.value },
+                    },
                   },
-                },
-              ],
+                ],
+              },
             },
+            limit: 15,
           },
-          limit: 15,
-        },
-      }),
-    });
-    if (res.ok) {
-      const rows: any[] = await res.json();
-      for (const row of rows) {
-        const docName = row?.document?.name;
-        if (docName && !String(docName).endsWith(`/${docId}`)) {
-          await fetch(`https://firestore.googleapis.com/v1/${docName}`, { method: 'DELETE' }).catch(() => {});
+        }),
+      });
+      if (res.ok) {
+        const rows: any[] = await res.json();
+        for (const row of rows) {
+          const docName = row?.document?.name;
+          if (docName && !String(docName).endsWith(`/${docId}`)) {
+            await fetch(`https://firestore.googleapis.com/v1/${docName}`, { method: 'DELETE' }).catch(() => {});
+          }
         }
       }
     }
@@ -345,9 +353,15 @@ export async function getTokensForUsers(
   if (allowedIds.length === 0) return [];
 
   const tokenToUser = new Map<string, number>();
+  const senderTokens = new Set<string>();
 
   for (const rec of Object.values(localTokens)) {
-    if (allowedIds.includes(rec.userId) && rec.token) {
+    if (!rec.token) continue;
+    if (excludeSenderId && rec.userId === excludeSenderId) {
+      senderTokens.add(rec.token);
+      continue;
+    }
+    if (allowedIds.includes(rec.userId)) {
       tokenToUser.set(rec.token, rec.userId);
     }
   }
@@ -366,7 +380,7 @@ export async function getTokensForUsers(
               value: { stringValue: 'fcm_device_token' },
             },
           },
-          limit: 400,
+          limit: 500,
         },
       }),
     });
@@ -377,12 +391,22 @@ export async function getTokensForUsers(
         if (!f) continue;
         const uid = Number(f.userId?.integerValue || 0);
         const tok = String(f.token?.stringValue || '').trim();
-        if (tok && allowedIds.includes(uid) && uid !== excludeSenderId) {
+        if (!tok) continue;
+        if (excludeSenderId && uid === excludeSenderId) {
+          senderTokens.add(tok);
+          tokenToUser.delete(tok);
+          continue;
+        }
+        if (allowedIds.includes(uid) && !senderTokens.has(tok)) {
           tokenToUser.set(tok, uid);
         }
       }
     }
   } catch {}
+
+  for (const sTok of senderTokens) {
+    tokenToUser.delete(sTok);
+  }
 
   return Array.from(tokenToUser.entries()).map(([token, userId]) => ({ token, userId }));
 }
@@ -392,6 +416,7 @@ export async function getTokensForUsers(
 // ==========================================
 
 let cachedAccessToken: string | null = null;
+let cachedAccessProjectId: string | null = null;
 let cachedTokenExpiry = 0;
 let cachedMetadataProjectId: string | null | undefined = undefined;
 let loggedMissingCredsWarning = false;
@@ -412,7 +437,7 @@ function parseValidServiceAccountJson(): { client_email: string; private_key: st
       return {
         client_email: creds.client_email,
         private_key: creds.private_key,
-        project_id: String(creds.project_id || projectId),
+        project_id: String(creds.project_id || process.env.FCM_PROJECT_ID || projectId),
       };
     }
   } catch {}
@@ -426,29 +451,29 @@ function getValidLegacyServerKey(): string | null {
   return raw;
 }
 
-export function hasServerFcmCredentials(): { configured: boolean; mode: string; reason?: string } {
+export function hasServerFcmCredentials(): {
+  configured: boolean;
+  mode: string;
+  fcmProjectId?: string;
+  reason?: string;
+} {
   const sa = parseValidServiceAccountJson();
   if (sa) {
-    if (sa.project_id && sa.project_id !== projectId) {
-      return {
-        configured: false,
-        mode: 'project_mismatch',
-        reason: `Service account belongs to "${sa.project_id}" instead of "${projectId}"`,
-      };
-    }
-    return { configured: true, mode: 'service_account_v1' };
+    return { configured: true, mode: 'service_account_v1', fcmProjectId: sa.project_id };
   }
-  if (cachedMetadataProjectId === projectId) {
-    return { configured: true, mode: 'gce_metadata_adc_v1' };
+  const targetFcmProject = (process.env.FCM_PROJECT_ID || projectId).trim();
+  if (cachedMetadataProjectId && cachedMetadataProjectId === targetFcmProject) {
+    return { configured: true, mode: 'gce_metadata_adc_v1', fcmProjectId: targetFcmProject };
   }
   const legacy = getValidLegacyServerKey();
   if (legacy) {
-    return { configured: true, mode: 'legacy_server_key' };
+    return { configured: true, mode: 'legacy_server_key', fcmProjectId: targetFcmProject };
   }
   return {
     configured: false,
     mode: 'missing_credentials',
-    reason: `FIREBASE_SERVICE_ACCOUNT_KEY (JSON for project "${projectId}") is not configured on the server`,
+    fcmProjectId: targetFcmProject,
+    reason: `FIREBASE_SERVICE_ACCOUNT_KEY (Service Account JSON) is not configured on the server`,
   };
 }
 
@@ -457,15 +482,15 @@ function base64UrlEncode(input: Buffer | string): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-async function getGoogleOAuth2AccessToken(): Promise<string | null> {
+async function getGoogleOAuth2Auth(): Promise<{ accessToken: string; fcmProjectId: string } | null> {
   const now = Date.now();
-  if (cachedAccessToken && now < cachedTokenExpiry - 60_000) {
-    return cachedAccessToken;
+  if (cachedAccessToken && cachedAccessProjectId && now < cachedTokenExpiry - 60_000) {
+    return { accessToken: cachedAccessToken, fcmProjectId: cachedAccessProjectId };
   }
 
   // 1. Service Account JSON (FIREBASE_SERVICE_ACCOUNT_KEY or GCP_SERVICE_ACCOUNT_KEY)
   const creds = parseValidServiceAccountJson();
-  if (creds && (!creds.project_id || creds.project_id === projectId)) {
+  if (creds) {
     try {
       const iat = Math.floor(now / 1000);
       const exp = iat + 3600;
@@ -498,8 +523,9 @@ async function getGoogleOAuth2AccessToken(): Promise<string | null> {
         const tokenData: any = await tokenRes.json();
         if (tokenData.access_token) {
           cachedAccessToken = tokenData.access_token;
+          cachedAccessProjectId = creds.project_id;
           cachedTokenExpiry = now + (Number(tokenData.expires_in) || 3500) * 1000;
-          return cachedAccessToken;
+          return { accessToken: cachedAccessToken!, fcmProjectId: creds.project_id };
         }
       } else {
         const errBody = await tokenRes.text().catch(() => '');
@@ -510,7 +536,8 @@ async function getGoogleOAuth2AccessToken(): Promise<string | null> {
     }
   }
 
-  // 2. GCE / Cloud Run Metadata Server ADC — ONLY if running inside the matching Firebase GCP project!
+  // 2. GCE / Cloud Run Metadata Server ADC — ONLY if running inside the matching Firebase GCP project
+  const targetFcmProject = (process.env.FCM_PROJECT_ID || projectId).trim();
   try {
     if (cachedMetadataProjectId === undefined) {
       const ctrlProj = new AbortController();
@@ -523,7 +550,7 @@ async function getGoogleOAuth2AccessToken(): Promise<string | null> {
       cachedMetadataProjectId = projRes.ok ? (await projRes.text()).trim() : null;
     }
 
-    if (cachedMetadataProjectId === projectId) {
+    if (cachedMetadataProjectId && cachedMetadataProjectId === targetFcmProject) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 1800);
       const metaRes = await fetch(
@@ -538,8 +565,9 @@ async function getGoogleOAuth2AccessToken(): Promise<string | null> {
         const metaData: any = await metaRes.json();
         if (metaData.access_token) {
           cachedAccessToken = metaData.access_token;
+          cachedAccessProjectId = targetFcmProject;
           cachedTokenExpiry = now + (Number(metaData.expires_in) || 1800) * 1000;
-          return cachedAccessToken;
+          return { accessToken: cachedAccessToken!, fcmProjectId: targetFcmProject };
         }
       }
     }
@@ -547,11 +575,11 @@ async function getGoogleOAuth2AccessToken(): Promise<string | null> {
     cachedMetadataProjectId = null;
   }
 
-  if (!loggedMissingCredsWarning) {
+  if (!loggedMissingCredsWarning && !getValidLegacyServerKey()) {
     loggedMissingCredsWarning = true;
     console.warn(
-      `[FCM] Server FCM HTTP v1 credentials are not configured for Firebase project "${projectId}". ` +
-        `Set FIREBASE_SERVICE_ACCOUNT_KEY to a valid Service Account JSON from "${projectId}" to enable killed-app FCM pushes.`
+      `[FCM] Server FCM HTTP v1 credentials are not configured. ` +
+        `Set FIREBASE_SERVICE_ACCOUNT_KEY to a valid Firebase Service Account JSON to enable closed-app FCM pushes.`
     );
   }
 
@@ -562,17 +590,18 @@ async function getGoogleOAuth2AccessToken(): Promise<string | null> {
 // 3. DEDUPLICATION & ACTUAL PUSH SENDING
 // ==========================================
 
+const DEDUP_WINDOW_MS = 20 * 60 * 1000; // 20 minutes (exceeds 15-minute outbox TTL)
 const recentSentPushKeys = new Map<string, number>();
 
 function isAlreadySentRecently(dedupKey: string): boolean {
   const now = Date.now();
-  if (recentSentPushKeys.size > 500) {
+  if (recentSentPushKeys.size > 1000) {
     for (const [k, ts] of recentSentPushKeys.entries()) {
-      if (now - ts > 120_000) recentSentPushKeys.delete(k);
+      if (now - ts > DEDUP_WINDOW_MS) recentSentPushKeys.delete(k);
     }
   }
   const prev = recentSentPushKeys.get(dedupKey);
-  if (prev && now - prev < 60_000) return true;
+  if (prev && now - prev < DEDUP_WINDOW_MS) return true;
   recentSentPushKeys.set(dedupKey, now);
   return false;
 }
@@ -588,53 +617,68 @@ export interface ChatPushPayload {
   senderId?: number;
 }
 
-async function sendSingleFcmV1(
-  accessToken: string,
-  targetToken: string,
-  recipientUserId: number,
-  payload: ChatPushPayload
-): Promise<{ ok: boolean; invalidToken?: boolean; error?: string }> {
-  const url = `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`;
-  const channelIdAndroid = payload.chatType === 'private' ? 'sami_private_messages_v2' : 'sami_channel_messages_v2';
-  const tagKey = payload.messageId || `${payload.chatType}_${payload.channelId || payload.partnerId || 'msg'}`;
-
-  const dataMap: Record<string, string> = {
+function buildDataPayload(recipientUserId: number, payload: ChatPushPayload): Record<string, string> {
+  const partnerStr = payload.partnerId ? String(payload.partnerId) : '';
+  return {
     title: payload.title,
     body: payload.body,
     chatType: payload.chatType,
+    type: payload.chatType === 'private' ? 'private_message' : 'channel_important',
     channelId: payload.channelId || '',
-    partnerId: payload.partnerId ? String(payload.partnerId) : '',
+    partnerId: partnerStr,
+    partnerIdStr: partnerStr,
+    privateChatWithUserId: partnerStr,
     recipientUserId: String(recipientUserId),
     messageId: payload.messageId || '',
     senderName: payload.senderName || 'Sami',
     senderId: payload.senderId ? String(payload.senderId) : '',
+    fromNotification: 'true',
   };
+}
 
-  // Send BOTH notification + data with high priority so Android OS wakes app when killed/swiped
-  // AND delivers to SamiFirebaseMessagingService in foreground.
-  // For private messages, redact lockscreen notification body if sensitive while keeping full data payload for authorized unlocked session.
-  const osNotificationBody =
-    payload.chatType === 'private' ? 'لديك رسالة خاصة جديدة — افتح التطبيق لعرضها' : payload.body;
+async function sendSingleFcmV1(
+  accessToken: string,
+  fcmProjectId: string,
+  targetToken: string,
+  recipientUserId: number,
+  payload: ChatPushPayload
+): Promise<{ ok: boolean; invalidToken?: boolean; error?: string }> {
+  const url = `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(fcmProjectId)}/messages:send`;
+  const channelIdAndroid = payload.chatType === 'private' ? 'sami_private_messages_v2' : 'sami_channel_messages_v2';
+  const tagKey = (payload.messageId || `${payload.chatType}_${payload.channelId || payload.partnerId || 'msg'}`).slice(
+    0,
+    64
+  );
+  const dataMap = buildDataPayload(recipientUserId, payload);
 
+  // Hybrid notification + data with HIGH Android priority:
+  // - When app UI is closed / swiped away from Recents: Google Play Services displays the OS notification
+  //   directly in the system tray and launches MainActivity via action `OPEN_SAMI_CHAT` with all `data`
+  //   extras attached so cold-start opens the exact target conversation.
+  // - When app is in foreground: delivered to SamiFirebaseMessagingService.onMessageReceived(), which
+  //   suppresses banners if the user is already inside that exact conversation.
+  // - Private messages are strictly sent ONLY to receiverId's tokens with `visibility: PRIVATE` so Android
+  //   automatically hides sensitive content on locked screens.
   const messageBody = {
     message: {
       token: targetToken,
       notification: {
         title: payload.title,
-        body: osNotificationBody,
+        body: payload.body,
       },
       data: dataMap,
       android: {
         priority: 'HIGH',
         ttl: '86400s',
-        collapse_key: tagKey.slice(0, 64),
+        collapse_key: tagKey,
         notification: {
           channel_id: channelIdAndroid,
           sound: 'default',
+          default_sound: true,
           default_vibrate_timings: true,
           notification_priority: 'PRIORITY_HIGH',
           visibility: payload.chatType === 'private' ? 'PRIVATE' : 'PUBLIC',
-          tag: tagKey.slice(0, 64),
+          tag: tagKey,
           click_action: 'OPEN_SAMI_CHAT',
         },
       },
@@ -658,10 +702,104 @@ async function sendSingleFcmV1(
   const isInvalid =
     res.status === 404 ||
     errText.includes('UNREGISTERED') ||
-    errText.includes('INVALID_ARGUMENT') ||
-    errText.includes('registration-token-not-registered');
+    errText.includes('registration-token-not-registered') ||
+    (res.status === 400 && errText.includes('The registration token is not a valid FCM registration token'));
 
   return { ok: false, invalidToken: isInvalid, error: `${res.status}: ${errText.slice(0, 180)}` };
+}
+
+async function sendSingleFcmLegacy(
+  legacyServerKey: string,
+  targetToken: string,
+  recipientUserId: number,
+  payload: ChatPushPayload
+): Promise<{ ok: boolean; invalidToken?: boolean; error?: string }> {
+  const channelIdAndroid = payload.chatType === 'private' ? 'sami_private_messages_v2' : 'sami_channel_messages_v2';
+  const tagKey = (payload.messageId || `${payload.chatType}_${payload.channelId || payload.partnerId || 'msg'}`).slice(
+    0,
+    64
+  );
+  const dataMap = buildDataPayload(recipientUserId, payload);
+
+  const res = await fetch('https://fcm.googleapis.com/fcm/send', {
+    method: 'POST',
+    headers: {
+      Authorization: `key=${legacyServerKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      to: targetToken,
+      priority: 'high',
+      time_to_live: 86400,
+      collapse_key: tagKey,
+      notification: {
+        title: payload.title,
+        body: payload.body,
+        sound: 'default',
+        android_channel_id: channelIdAndroid,
+        tag: tagKey,
+        click_action: 'OPEN_SAMI_CHAT',
+      },
+      data: dataMap,
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    return { ok: false, error: `${res.status}: ${errText.slice(0, 180)}` };
+  }
+
+  const json: any = await res.json().catch(() => ({}));
+  if (Number(json?.success) > 0) {
+    return { ok: true };
+  }
+  const errCode = String(json?.results?.[0]?.error || 'legacy_send_failed');
+  const isInvalid = errCode === 'NotRegistered' || errCode === 'InvalidRegistration';
+  return { ok: false, invalidToken: isInvalid, error: errCode };
+}
+
+async function markMatchingPendingOutboxDocsSent(messageId: string): Promise<void> {
+  if (!messageId) return;
+  try {
+    const res = await fetch(`${getFirestoreBaseUrl()}:runQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: SHARED_NOTIF_COLLECTION }],
+          where: {
+            compositeFilter: {
+              op: 'AND',
+              filters: [
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'messageId' },
+                    op: 'EQUAL',
+                    value: { stringValue: messageId },
+                  },
+                },
+                {
+                  fieldFilter: {
+                    field: { fieldPath: 'fcmStatus' },
+                    op: 'EQUAL',
+                    value: { stringValue: 'pending' },
+                  },
+                },
+              ],
+            },
+          },
+          limit: 5,
+        },
+      }),
+    });
+    if (!res.ok) return;
+    const rows: any[] = await res.json();
+    for (const row of rows) {
+      if (row?.document?.name) {
+        await updateOutboxDocStatus(row.document.name, 'sent');
+      }
+    }
+  } catch {}
 }
 
 export async function sendNotificationToUsers(
@@ -673,8 +811,9 @@ export async function sendNotificationToUsers(
     return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
   }
 
-  const accessToken = await getGoogleOAuth2AccessToken();
-  if (!accessToken) {
+  const v1Auth = await getGoogleOAuth2Auth();
+  const legacyKey = v1Auth ? null : getValidLegacyServerKey();
+  if (!v1Auth && !legacyKey) {
     return { sentCount: 0, failedCount: recipients.length, credentialsConfigured: false };
   }
 
@@ -688,11 +827,16 @@ export async function sendNotificationToUsers(
         return;
       }
 
-      const result = await sendSingleFcmV1(accessToken, token, userId, payload);
+      const result = v1Auth
+        ? await sendSingleFcmV1(v1Auth.accessToken, v1Auth.fcmProjectId, token, userId, payload)
+        : await sendSingleFcmLegacy(legacyKey!, token, userId, payload);
+
       if (result.ok) {
         sentCount++;
       } else {
         failedCount++;
+        // Allow retry if transient network error
+        recentSentPushKeys.delete(dedupKey);
         if (result.invalidToken) {
           await pruneInvalidToken(token);
         } else if (result.error) {
@@ -701,6 +845,10 @@ export async function sendNotificationToUsers(
       }
     })
   );
+
+  if (sentCount > 0 && payload.messageId) {
+    markMatchingPendingOutboxDocsSent(payload.messageId).catch(() => {});
+  }
 
   return { sentCount, failedCount, credentialsConfigured: true };
 }
@@ -726,7 +874,7 @@ export async function dispatchAuthorizedChatPush(params: {
       return { sentCount: 0, failedCount: 0, credentialsConfigured: hasServerFcmCredentials().configured };
     }
     const title = senderId === 1 ? '👑 رسالة خاصة من القائد Sami' : `💬 رسالة خاصة من ${senderName}`;
-    const body = snippet && snippet.trim() ? snippet.trim().slice(0, 100) : 'لديك رسالة خاصة جديدة';
+    const body = snippet && snippet.trim() ? snippet.trim().slice(0, 120) : 'لديك رسالة خاصة جديدة';
     return sendNotificationToUsers([receiverId], {
       title,
       body,
@@ -775,7 +923,7 @@ export async function dispatchAuthorizedChatPush(params: {
 
   return sendNotificationToUsers(recipientIds, {
     title: `${senderPrefix} • ${channel.name}`,
-    body: snippet && snippet.trim() ? snippet.trim().slice(0, 100) : 'رسالة جديدة في القناة',
+    body: snippet && snippet.trim() ? snippet.trim().slice(0, 120) : 'رسالة جديدة في القناة',
     chatType: 'channel',
     channelId: channel.id,
     messageId,
@@ -810,9 +958,9 @@ async function pollPendingFcmOutbox(): Promise<void> {
   if (outboxPollingActive) return;
   outboxPollingActive = true;
   try {
-    // Trigger ADC check once on first poll so hasServerFcmCredentials() knows if GCE ADC matches projectId
-    const accessToken = await getGoogleOAuth2AccessToken();
-    if (!accessToken) {
+    const v1Auth = await getGoogleOAuth2Auth();
+    const legacyKey = v1Auth ? null : getValidLegacyServerKey();
+    if (!v1Auth && !legacyKey) {
       return;
     }
 

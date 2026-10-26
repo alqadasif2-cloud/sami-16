@@ -86,6 +86,7 @@ class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private var activeWebView: WebView? = null
     internal var pendingDeepLinkScript: String? = null
+    internal var pendingDeepLinkQueryJson: String? = null
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -280,10 +281,6 @@ class MainActivity : ComponentActivity() {
                             activity = this@MainActivity,
                             onWebViewReady = { wv ->
                                 activeWebView = wv
-                                pendingDeepLinkScript?.let { script ->
-                                    wv.postDelayed({ wv.evaluateJavascript(script, null) }, 500)
-                                    pendingDeepLinkScript = null
-                                }
                             },
                             onFallbackToNative = {
                                 android.util.Log.w("SamiApp", "Falling back to native Android interface.")
@@ -343,64 +340,99 @@ class MainActivity : ComponentActivity() {
 
     private fun processDeepLinkIntent(intent: Intent?) {
         if (intent == null) return
-        val channelId = intent.getStringExtra("channelId") ?: ""
-        val partnerId = intent.getStringExtra("partnerIdStr")?.toIntOrNull()
-            ?: intent.getStringExtra("partnerId")?.toIntOrNull()
+        val channelId = intent.getStringExtra("channelId")?.trim() ?: ""
+        val rawType = (intent.getStringExtra("chatType") ?: intent.getStringExtra("type") ?: "").trim()
+        val explicitPartner = intent.getStringExtra("partnerIdStr")?.trim()?.toIntOrNull()
+            ?: intent.getStringExtra("partnerId")?.trim()?.toIntOrNull()
+            ?: intent.getStringExtra("privateChatWithUserId")?.trim()?.toIntOrNull()
             ?: if (intent.hasExtra("partnerId")) {
                 val p = intent.getIntExtra("partnerId", 0)
                 if (p > 0) p else null
             } else null
-        val chatType = intent.getStringExtra("chatType") ?: if (partnerId != null && partnerId > 0) "private" else "channel"
-        val messageId = intent.getStringExtra("messageId") ?: ""
-        val senderName = intent.getStringExtra("senderName") ?: ""
+        val senderIdInt = intent.getStringExtra("senderId")?.trim()?.toIntOrNull()
+        val isPrivate = rawType == "private" || rawType == "private_message" || (explicitPartner != null && explicitPartner > 0)
+        val partnerId = explicitPartner ?: if (isPrivate && senderIdInt != null && senderIdInt > 0) senderIdInt else null
+        val chatType = if (isPrivate) "private" else "channel"
+        val messageId = intent.getStringExtra("messageId")?.trim() ?: ""
+        val senderName = intent.getStringExtra("senderName")?.trim() ?: ""
+        val targetRecipient = intent.getStringExtra("recipientUserId")?.trim()?.toIntOrNull()
 
-        if (channelId.isNotEmpty() || (partnerId != null && partnerId > 0) || messageId.isNotEmpty()) {
-            val safeChan = if (channelId.isNotEmpty()) "'${escapeJsString(channelId)}'" else "null"
-            val safeMsg = if (messageId.isNotEmpty()) "'${escapeJsString(messageId)}'" else "null"
-            val safeSender = if (senderName.isNotEmpty()) "'${escapeJsString(senderName)}'" else "null"
-            val safeType = escapeJsString(chatType)
+        val hasNavigationTarget = channelId.isNotEmpty() || (partnerId != null && partnerId > 0) || messageId.isNotEmpty()
+        if (!hasNavigationTarget) return
 
-            val script = """
-                (function() {
-                    var payload = {
-                        channelId: $safeChan,
-                        partnerId: ${partnerId ?: "null"},
-                        privateChatWithUserId: ${partnerId ?: "null"},
-                        chatType: '$safeType',
-                        type: '${if (chatType == "private") "private_message" else "channel_important"}',
-                        messageId: $safeMsg,
-                        senderName: $safeSender
-                    };
-                    if (typeof window !== 'undefined') {
-                        window.__samiPendingDeepLink = payload;
-                        if (typeof window.dispatchNotificationDeepLink === 'function') {
-                            window.dispatchNotificationDeepLink(payload);
-                        } else {
-                            window.dispatchEvent(new CustomEvent('app_open_chat_message', { detail: payload }));
-                        }
-                    }
-                })();
-            """.trimIndent()
+        // Clear consumed extras immediately so screen rotation never re-triggers stale navigation
+        intent.removeExtra("channelId")
+        intent.removeExtra("partnerId")
+        intent.removeExtra("partnerIdStr")
+        intent.removeExtra("privateChatWithUserId")
+        intent.removeExtra("recipientUserId")
+        intent.removeExtra("chatType")
+        intent.removeExtra("type")
+        intent.removeExtra("messageId")
+        intent.removeExtra("senderName")
+        intent.removeExtra("senderId")
+        intent.removeExtra("fromNotification")
 
-            // Clear consumed extras so rotation doesn't re-trigger old navigation
-            intent.removeExtra("channelId")
-            intent.removeExtra("partnerId")
-            intent.removeExtra("partnerIdStr")
-            intent.removeExtra("messageId")
+        // Verify recipient authorization before navigating to private/channel conversation
+        val currentUid = SamiFirebaseMessagingService.getCurrentUserId(this)
+        if (currentUid <= 0 || (targetRecipient != null && targetRecipient > 0 && currentUid != targetRecipient)) {
+            android.util.Log.w(
+                "SamiFCM",
+                "Blocked notification deep link for unauthorized/logged-out user (current=$currentUid, target=$targetRecipient)"
+            )
+            return
+        }
 
-            val wv = activeWebView
-            if (wv != null) {
-                wv.post { wv.evaluateJavascript(script, null) }
-                wv.postDelayed({ wv.evaluateJavascript(script, null) }, 600)
+        val payloadJson = JSONObject().apply {
+            if (channelId.isNotEmpty()) put("channelId", channelId) else put("channelId", JSONObject.NULL)
+            if (partnerId != null && partnerId > 0) {
+                put("partnerId", partnerId)
+                put("privateChatWithUserId", partnerId)
             } else {
-                pendingDeepLinkScript = script
+                put("partnerId", JSONObject.NULL)
+                put("privateChatWithUserId", JSONObject.NULL)
             }
+            put("chatType", chatType)
+            put("type", if (chatType == "private") "private_message" else "channel_important")
+            if (messageId.isNotEmpty()) put("messageId", messageId) else put("messageId", JSONObject.NULL)
+            if (senderName.isNotEmpty()) put("senderName", senderName) else put("senderName", JSONObject.NULL)
+        }.toString()
+
+        val dedupKey = escapeJsString("${chatType}:${channelId}:${partnerId ?: 0}:${messageId}")
+        val script = """
+            (function() {
+                if (typeof window === 'undefined') return;
+                if (window.__samiLastDeepLinkKey === '$dedupKey') return;
+                window.__samiLastDeepLinkKey = '$dedupKey';
+                setTimeout(function() {
+                    if (window.__samiLastDeepLinkKey === '$dedupKey') {
+                        window.__samiLastDeepLinkKey = null;
+                    }
+                }, 2500);
+                var payload = $payloadJson;
+                window.__samiPendingDeepLink = payload;
+                if (typeof window.dispatchNotificationDeepLink === 'function') {
+                    window.dispatchNotificationDeepLink(payload);
+                } else {
+                    window.dispatchEvent(new CustomEvent('app_open_chat_message', { detail: payload }));
+                }
+            })();
+        """.trimIndent()
+
+        val wv = activeWebView
+        if (wv != null) {
+            wv.post { wv.evaluateJavascript(script, null) }
+            wv.postDelayed({ wv.evaluateJavascript(script, null) }, 650)
+        } else {
+            pendingDeepLinkQueryJson = payloadJson
+            pendingDeepLinkScript = script
         }
     }
 
     fun initFcmToken() {
         try {
             FirebaseCloudHelper.ensureInitialized(this)
+            runCatching { FirebaseMessaging.getInstance().isAutoInitEnabled = true }
             FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
                 if (task.isSuccessful) {
                     val token = task.result?.trim() ?: ""
@@ -460,6 +492,17 @@ class MainActivity : ComponentActivity() {
             startActivity(intent)
         } catch (e: Exception) {
             android.util.Log.w("SamiApp", "Failed to open settings: ${e.message}")
+        }
+    }
+
+    fun openBatteryOptimizationSettingsInternal() {
+        try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", packageName, null)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            android.util.Log.w("SamiApp", "Failed to open app details settings: ${e.message}")
         }
     }
 
@@ -533,6 +576,20 @@ class SamiAndroidBridge(
         activity.runOnUiThread {
             activity.openNotificationSettingsInternal()
         }
+    }
+
+    @JavascriptInterface
+    fun openBatterySettings() {
+        activity.runOnUiThread {
+            activity.openBatteryOptimizationSettingsInternal()
+        }
+    }
+
+    @JavascriptInterface
+    fun consumePendingDeepLink(): String {
+        val raw = activity.pendingDeepLinkQueryJson ?: ""
+        activity.pendingDeepLinkQueryJson = null
+        return raw
     }
 
     @JavascriptInterface
@@ -801,7 +858,15 @@ fun FullAppWebView(
                         }
                     }
 
-                    loadUrl("https://appassets.androidplatform.net/index.html")
+                    val initialDeepLink = activity.pendingDeepLinkQueryJson
+                    activity.pendingDeepLinkQueryJson = null
+                    val initialUrl = if (!initialDeepLink.isNullOrBlank()) {
+                        activity.pendingDeepLinkScript = null
+                        "https://appassets.androidplatform.net/index.html?sami_deeplink=" + Uri.encode(initialDeepLink)
+                    } else {
+                        "https://appassets.androidplatform.net/index.html"
+                    }
+                    loadUrl(initialUrl)
                     webViewInstance = this
                     onWebViewReady(this)
                 }

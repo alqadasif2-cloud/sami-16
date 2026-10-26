@@ -63,6 +63,87 @@ jobs:
           fi
           echo "✅ Verified: app/src/main/assets/index.html is the pure Sami app."
 
+      # 2b. Sync Android FCM Resources from google-services.json (if file or secret is provided)
+      - name: Configure Android FCM Resources
+        env:
+          GOOGLE_SERVICES_JSON_SECRET: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, xml.etree.ElementTree as ET
+
+          gs_data = None
+          secret_raw = os.environ.get("GOOGLE_SERVICES_JSON_SECRET", "").strip()
+          if secret_raw:
+              try:
+                  gs_data = json.loads(secret_raw)
+                  print("Loaded Android FCM config from GOOGLE_SERVICES_JSON secret.")
+              except Exception as exc:
+                  print(f"Warning: Could not parse GOOGLE_SERVICES_JSON secret: {exc}")
+
+          if gs_data is None and os.path.isfile("app/google-services.json"):
+              try:
+                  with open("app/google-services.json", "r", encoding="utf-8") as fh:
+                      gs_data = json.load(fh)
+                  print("Loaded Android FCM config from app/google-services.json.")
+              except Exception as exc:
+                  print(f"Warning: Could not parse app/google-services.json: {exc}")
+
+          if not gs_data:
+              print("No app/google-services.json or GOOGLE_SERVICES_JSON secret found; keeping existing strings.xml.")
+              raise SystemExit(0)
+
+          proj_info = gs_data.get("project_info") or {}
+          clients = gs_data.get("client") or []
+          selected_client = None
+          for c in clients:
+              pkg = (((c.get("client_info") or {}).get("android_client_info") or {}).get("package_name") or "").strip()
+              if pkg == "com.sami.tradingchallengetracker":
+                  selected_client = c
+                  break
+          if selected_client is None and clients:
+              selected_client = clients[0]
+
+          if not selected_client:
+              print("Warning: google-services.json contains no client entries; skipping strings.xml update.")
+              raise SystemExit(0)
+
+          app_id = ((selected_client.get("client_info") or {}).get("mobilesdk_app_id") or "").strip()
+          api_keys = selected_client.get("api_key") or []
+          api_key = (api_keys[0].get("current_key") if api_keys else "") or ""
+          api_key = api_key.strip()
+          sender_id = (proj_info.get("project_number") or "").strip()
+          project_id = (proj_info.get("project_id") or "").strip()
+          storage_bucket = (proj_info.get("storage_bucket") or "").strip()
+
+          if not (app_id and api_key and sender_id and project_id):
+              print("Warning: Incomplete fields in google-services.json; skipping strings.xml update.")
+              raise SystemExit(0)
+
+          strings_path = "app/src/main/res/values/strings.xml"
+          tree = ET.parse(strings_path)
+          root = tree.getroot()
+          updates = {
+              "google_app_id": app_id,
+              "gcm_defaultSenderId": sender_id,
+              "project_id": project_id,
+              "google_api_key": api_key,
+              "google_crash_reporting_api_key": api_key,
+          }
+          if storage_bucket:
+              updates["google_storage_bucket"] = storage_bucket
+
+          existing = {el.attrib.get("name"): el for el in root.findall("string")}
+          for k, v in updates.items():
+              if k in existing:
+                  existing[k].text = v
+              else:
+                  el = ET.SubElement(root, "string", {"name": k, "translatable": "false"})
+                  el.text = v
+
+          tree.write(strings_path, encoding="utf-8", xml_declaration=True)
+          print(f"✅ Updated {strings_path} with Android mobilesdk_app_id for project '{project_id}'.")
+          PYEOF
+
       # 3. Setup Java 17
       - name: Set up JDK 17
         uses: actions/setup-java@v4
