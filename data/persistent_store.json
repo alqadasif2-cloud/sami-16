@@ -1,0 +1,190 @@
+{
+  "users": {
+    "1": {
+      "id": 1,
+      "username": "Sami",
+      "displayName": "القائد Sami",
+      "passwordHash": "df296d8ba60ffd5550bb7df6991cc9ce6e923cf827a63211da62849409d0d42e",
+      "salt": "6494a3847d9d9c8e05864d11a5e37f3f",
+      "role": "owner",
+      "avatarUrl": null,
+      "warningsCount": 0,
+      "createdAt": 1792738179580,
+      "updatedAt": 1792738179580
+    },
+    "2": {
+      "id": 2,
+      "username": "RegularUser",
+      "displayName": "مستخدم عادي",
+      "passwordHash": "23e35ea44694df63513331d89757f7d7a57154a8f0da87cf4b9c2dc6785af4ec",
+      "salt": "315de3ff28c7d36f9274042c253e4677",
+      "role": "user",
+      "avatarUrl": null,
+      "warningsCount": 0,
+      "createdAt": 1792738194220,
+      "updatedAt": 1792738194220
+    },
+    "3": {
+      "id": 3,
+      "username": "ModeratorOne",
+      "displayName": "المشرف أحمد",
+      "passwordHash": "05420f2bfddb05306c213b0d7e63ccb34aa6f0549825241cbb59bda3653bea45",
+      "salt": "8730dca1540a30f937ea489cdf80d692",
+      "role": "moderator",
+      "avatarUrl": null,
+      "warningsCount": 0,
+      "createdAt": 1792890448411,
+      "updatedAt": 1792890448411
+    }
+  },
+  "channels": {
+    "general_trading": {
+      "id": "general_trading",
+      "name": "💬 دردشة عامة - دفعة 3000$",
+      "description": "القناة العامة لتبادل الأفكار والنقاشات بين جميع المشتركين.",
+      "isPrivate": false,
+      "visibility": "public",
+      "allowedMemberIds": [],
+      "memberIds": [
+        1
+      ],
+      "createdAt": 1735689600000
+    },
+    "signals_vip": {
+      "id": "signals_vip",
+      "name": "👑 قناة Sami VIP الخاصة",
+      "description": "قناة التوصيات والصفقات المتقدمة الخاصة بالأعضاء المصرح لهم فقط.",
+      "isPrivate": true,
+      "visibility": "hidden",
+      "allowedMemberIds": [
+        1
+      ],
+      "memberIds": [
+        1
+      ],
+      "createdAt": 1735689600000
+    }
+  },
+  "channelMessages": {
+    "general_trading": [
+      {
+        "id": "msg_1792738179751_1_bwpkr",
+        "channelId": "general_trading",
+        "senderId": 1,
+        "senderName": "القائد Sami",
+        "senderRole": "owner",
+        "senderAvatarUrl": null,
+        "text": "رسالة اختبار دائمة قبل إعادة تشغيل الخادم",
+        "replyToId": null,
+        "isDeleted": false,
+        "timestamp": 1792738179751
+      },
+      {
+        "id": "msg_1792892554367_1792892433_apyp8",
+        "channelId": "general_trading",
+        "senderId": 1792892433,
+        "senderName": "زائر تجريبي",
+        "senderRole": "guest",
+        "senderAvatarUrl": null,
+        "text": "السلام عليكم، مرحباً بالجميع في قناة التداول العامة",
+        "replyToId": null,
+        "isDeleted": false,
+        "timestamp": 1792892554367
+      }
+    ]
+  },
+  "privateMessages": {
+    "1_2": [
+      {
+        "id": "pm_1792739650030_1_lr59l",
+        "senderId": 1,
+        "receiverId": 2,
+        "senderName": "القائد Sami",
+        "senderRole": "owner",
+        "text": "مرحبا، هذه رسالة خاصة تجريبية",
+        "timestamp": 1792739650030
+      }
+    ],
+    "1_3": [
+      {
+        "id": "pm_1792890455043_3_uklh4",
+        "senderId": 3,
+        "receiverId": 1,
+        "senderName": "المشرف أحمد",
+        "senderRole": "user",
+        "senderAvatarUrl": null,
+        "text": "السلام عليكم القائد Sami، هذا تقرير جديد.",
+        "timestamp": 1792890455043
+      }
+    ]
+  },
+  "challenges": {
+    "1": {
+      "id": "challenge_1",
+      "userId": 1,
+      "userName": "القائد Sami",
+      "initialCapitalCents": 10000,
+      "currentBalanceCents": 15000,
+      "targetBalanceCents": 300000,
+      "tradeCount": 1,
+      "challengeStarted": true,
+      "createdAt": 1792738179805,
+      "updatedAt": 1792738179852
+    }
+  },
+  "trades": {
+    "1": [
+      {
+        "id": "trade_1792738179852_1_1",
+        "challengeId": "challenge_1",
+        "userId": 1,
+        "tradeNumber": 1,
+        "resultCents": 5000,
+        "oldBalanceCents": 10000,
+        "newBalanceCents": 15000,
+        "type": "WIN",
+        "attachmentPath": null,
+        "timestamp": 1792738179852
+      }
+    ]
+  },
+  "appUpdates": {
+    "id": "latest",
+    "versionName": "1.3.0",
+    "versionCode": 11,
+    "downloadUrl": "https://github.com/alqadasif2-cloud/SSAMIII77777/actions",
+    "description": "الإصدار 1.3.0 متوفر الآن مع تحسينات في حماية الضيوف وسرعة الباقات وإدارة المشرفين.",
+    "isMandatory": false,
+    "minSupportedVersionCode": 11,
+    "publishedBy": "Sami",
+    "updatedAt": 1792919368022,
+    "isActive": false,
+    "isHidden": true
+  },
+  "appUpdatesHistory": [
+    {
+      "id": "latest",
+      "versionName": "1.3.2",
+      "versionCode": 14,
+      "downloadUrl": "https://github.com/alqadasif2-cloud/Sami-13/actions",
+      "description": "تحديث جديد لاختبار النشر المستقبلي بعد إيقاف التحديث السابق.",
+      "isMandatory": false,
+      "publishedBy": "القائد Sami",
+      "updatedAt": 1792919367793,
+      "isActive": false,
+      "isHidden": true
+    },
+    {
+      "id": "latest",
+      "versionName": "1.3.1",
+      "versionCode": 13,
+      "downloadUrl": "https://github.com/alqadasif2-cloud/Sami-13/actions",
+      "description": "إصدار Sami الجديد متوفر الآن مع تحسينات شاملة وسرعة فائقة.",
+      "isMandatory": true,
+      "publishedBy": "القائد Sami",
+      "updatedAt": 1792919367793,
+      "isActive": false,
+      "isHidden": true
+    }
+  ]
+}

@@ -1,0 +1,182 @@
+name: Build and Release Sami APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Verify Sami Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # 1. Checkout Source Code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Sync Pure Sami App Assets to Android (Never overwrite with dev Fix Center dist/)
+      - name: Sync Pure Sami Assets to Android
+        run: |
+          echo "Syncing pure Sami application assets to app/src/main/assets..."
+          rm -rf app/src/main/assets
+          mkdir -p app/src/main/assets/assets
+
+          cp public/index.html app/src/main/assets/index.html
+          cp public/manifest.json app/src/main/assets/manifest.json
+          cp public/firebase-messaging-sw.js app/src/main/assets/firebase-messaging-sw.js
+          cp public/favicon.png app/src/main/assets/favicon.png
+          cp public/icon-192.png app/src/main/assets/icon-192.png
+          cp public/icon-512.png app/src/main/assets/icon-512.png
+          cp public/app-icon.png app/src/main/assets/app-icon.png
+          cp public/logo.png app/src/main/assets/logo.png
+          cp public/background_image.jpg app/src/main/assets/background_image.jpg
+          cp public/background_video.mp4 app/src/main/assets/background_video.mp4
+          cp public/assets/index-D5y8_Xmj.css app/src/main/assets/assets/index-D5y8_Xmj.css
+          cp public/assets/index-DoqMLvwt.js app/src/main/assets/assets/index-DoqMLvwt.js
+
+          # Remove any backup or developer-only files if present
+          rm -f app/src/main/assets/sami.html
+          rm -f app/src/main/assets/*fix-center*
+          find app/src/main/assets -name "*.bak" -delete
+
+          echo "Verifying Android WebAssets entry point before Gradle build..."
+          grep -q "<title>Sami</title>" app/src/main/assets/index.html
+          grep -q "/assets/index-DoqMLvwt.js" app/src/main/assets/index.html
+          if grep -Eqi "src/main\.tsx|fix-center|sami\.html|GitHub Actions|مركز إصلاح" app/src/main/assets/index.html; then
+            echo "ERROR: Developer Fix Center markup detected in app/src/main/assets/index.html!"
+            exit 1
+          fi
+          echo "✅ Verified: app/src/main/assets/index.html is the pure Sami app."
+
+      # 3. Setup Java 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 4. Accept Android SDK Licenses & Setup
+      - name: Accept Android SDK Licenses
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses" || true
+          for SDK_BIN in "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_HOME/tools/bin/sdkmanager"; do
+            if [ -x "$SDK_BIN" ]; then
+              echo "Accepting licenses using $SDK_BIN"
+              yes | "$SDK_BIN" --licenses || true
+              break
+            fi
+          done
+
+      # 5. Setup Gradle Wrapper Cache
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      # 6. Verify & Ensure Root gradle.properties
+      - name: Verify & Ensure Root gradle.properties
+        run: |
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8 -XX:+UseParallelGC
+          kotlin.daemon.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m
+          android.useAndroidX=true
+          android.enableJetifier=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+          sed -i 's/^[[:space:]]*//' gradle.properties
+
+      # 7. Build & Inspect Final Android Release APK
+      - name: Build and Inspect Android Release APK
+        run: |
+          if [ ! -f "./gradlew" ] || [ ! -f "./gradle/wrapper/gradle-wrapper.jar" ]; then
+            gradle wrapper --gradle-version 8.6
+          fi
+          chmod +x ./gradlew
+
+          echo "========================================"
+          echo "Building Sami Release APK"
+          echo "========================================"
+          ./gradlew :app:assembleRelease \
+            -Pandroid.useAndroidX=true \
+            -Pandroid.enableJetifier=false \
+            --max-workers=2 \
+            --console=plain \
+            --stacktrace
+
+          APK_FILE=$(find app/build/outputs/apk/release/ -type f -name "*.apk" | head -n 1)
+          if [ -z "$APK_FILE" ] || [ ! -f "$APK_FILE" ]; then
+            echo "ERROR: No release APK found in app/build/outputs/apk/release/"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Inspecting Final Compiled APK Contents & Label"
+          echo "========================================"
+          # 1. Inspect embedded assets/index.html inside the APK zip
+          unzip -p "$APK_FILE" assets/index.html > /tmp/apk_index.html
+          grep -q "<title>Sami</title>" /tmp/apk_index.html
+          grep -q "/assets/index-DoqMLvwt.js" /tmp/apk_index.html
+          if grep -Eqi "src/main\.tsx|fix-center|sami\.html|GitHub Actions|مركز إصلاح" /tmp/apk_index.html; then
+            echo "ERROR: Fix Center detected inside compiled APK assets/index.html!"
+            exit 1
+          fi
+
+          # 2. Ensure no dev-fix-center files exist anywhere inside APK
+          if unzip -l "$APK_FILE" | grep -Eqi "fix-center|sami\.html|\.bak"; then
+            echo "ERROR: Unexpected developer/preview files found in APK!"
+            exit 1
+          fi
+
+          # 3. Verify compiled AndroidManifest label == 'Sami' via aapt2
+          AAPT2_BIN=$(find "$ANDROID_HOME/build-tools" -name "aapt2" | sort -V | tail -n 1)
+          if [ -n "$AAPT2_BIN" ] && [ -x "$AAPT2_BIN" ]; then
+            BADGING=$("$AAPT2_BIN" dump badging "$APK_FILE")
+            echo "$BADGING" | grep -E "package:|application-label"
+            echo "$BADGING" | grep -q "application-label:'Sami'"
+          fi
+
+          mkdir -p build-artifacts
+          cp "$APK_FILE" build-artifacts/Sami-Release.apk
+          sha256sum build-artifacts/Sami-Release.apk
+
+      # 10. Upload Release APK Artifact
+      - name: Upload Sami Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sami-Release
+          path: build-artifacts/Sami-Release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # 11. Publish Build Summary
+      - name: Publish Build Summary
+        if: always()
+        env:
+          BUILD_STATUS: ${{ job.status }}
+        run: |
+          echo "## 🚀 Sami Android Release Build Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BUILD_STATUS" = "success" ]; then
+            echo "### ✅ Build Status: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+            echo "Verified pure Sami UI, launcher name \`Sami\`, and signed Release APK." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ❌ Build Status: FAILED" >> "$GITHUB_STEP_SUMMARY"
+            echo "Please inspect the build logs above for troubleshooting." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **App Label**: \`Sami\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Artifact**: \`Sami-Release.apk\`" >> "$GITHUB_STEP_SUMMARY"
